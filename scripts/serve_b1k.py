@@ -51,6 +51,10 @@ class Args:
     dataset_root: str | None = "/scr/behavior/2025-challenge-demos"
     # If provided, will be used to retrieve the prompt of the task, otherwise use turning_on_radio as default.
     task_name: str | None = None
+    # Explicitly specify the task prompt (bypassing task_mapping.json); useful when the task prompt
+    # differs from the json entry during subtask evaluation. When the client injects obs["prompt"]
+    # at each step, this only serves as a fallback.
+    task_prompt: str | None = None
 
     # Port to serve the policy on.
     port: int = 8000
@@ -93,6 +97,7 @@ def main(args: Args) -> None:
     policy = B1KPolicyWrapper(
         policy,
         task_name=args.task_name,
+        task_prompt=args.task_prompt,
         control_mode=args.control_mode,
         max_len=args.max_len,
         action_horizon=args.action_horizon,

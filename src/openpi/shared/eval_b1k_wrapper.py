@@ -30,6 +30,7 @@ class B1KPolicyWrapper:
         self,
         policy: BasePolicy,
         task_name: str = "turning_on_radio",
+        task_prompt: str | None = None,
         control_mode: str = "temporal_ensemble",
         max_len: int = 32,  # receeding horizon | receeding temporal mode
         action_horizon: int = 5,  # temporal ensemble mode | receeding temporal mode
@@ -39,11 +40,16 @@ class B1KPolicyWrapper:
         self.policy = policy
         self.task_name = task_name
 
-        # load the task name from the metadata
-        metadata = json.load(open("scripts/task_mapping.json"))
-        self.task_prompt = metadata[task_name].get("task")
-        self.subtask_prompts = metadata[task_name].get("subtask")
-        self.skill_prompts = metadata[task_name].get("skill")
+        # Load task metadata from task_mapping.json. An explicitly provided task_prompt takes
+        # precedence; otherwise fall back to the json entry, and finally to the task name itself.
+        try:
+            metadata = json.load(open("scripts/task_mapping.json"))
+            task_info = metadata.get(task_name or "", {})
+        except (FileNotFoundError, json.JSONDecodeError):
+            task_info = {}
+        self.task_prompt = task_prompt or task_info.get("task", task_name or "complete the task")
+        self.subtask_prompts = task_info.get("subtask")
+        self.skill_prompts = task_info.get("skill")
 
         self.control_mode = control_mode
         self.action_queue = deque(maxlen=action_horizon)
@@ -54,6 +60,10 @@ class B1KPolicyWrapper:
         self.max_len = max_len  # how long the policy sequences are
         self.temporal_ensemble_max = temporal_ensemble_max  # max number of sequences to ensemble
         self.step_counter = 0
+
+        # Tracks the active prompt of the previous step; used to log prompt switches only when
+        # the value actually changes. Cleared in reset() so each episode's first step always logs.
+        self.last_active_prompt = None
 
         self.fine_grained_level = fine_grained_level
         if self.fine_grained_level > 0:
@@ -83,6 +93,8 @@ class B1KPolicyWrapper:
         self.action_queue = deque(maxlen=self.action_horizon)
         self.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         self.step_counter = 0
+        # Clear the tracker so the first step of every episode logs its active prompt.
+        self.last_active_prompt = None
         if self.reasoner:
             self.reasoner.reset()
 
@@ -135,7 +147,9 @@ class B1KPolicyWrapper:
 
         return processed_obs
 
-    def act_receeding_temporal(self, input_obs):
+    def act_receeding_temporal(self, input_obs, active_prompt=None):
+        if active_prompt is None:
+            active_prompt = self.task_prompt
         # Step 1: check if we should re-run policy
         if self.step_counter % self.replan_interval == 0:
             nbatch = copy.deepcopy(input_obs)
@@ -151,7 +165,7 @@ class B1KPolicyWrapper:
                 "observation/wrist_image_left": nbatch["observation"][0, 1],
                 "observation/wrist_image_right": nbatch["observation"][0, 2],
                 "observation/state": joint_positions,
-                "prompt": self.task_prompt,
+                "prompt": active_prompt,
             }
 
             if self.fine_grained_level > 0:
@@ -242,9 +256,28 @@ class B1KPolicyWrapper:
             Dtype: float64
             Shape: (10, 16)
         """
+        # If the caller injects a prompt into the obs (e.g. the skill instruction during subtask
+        # evaluation), it takes precedence over the task prompt. Some msgpack versions deserialize
+        # strings as bytes, so decode them uniformly here. This must happen before process_obs,
+        # which rebuilds the obs dict and would drop the prompt key.
+        raw_prompt = input_obs.pop("prompt", None)
+        if isinstance(raw_prompt, bytes):
+            raw_prompt = raw_prompt.decode("utf-8")
+        active_prompt = raw_prompt or self.task_prompt
+
+        # Debug: log the active prompt only when it changes (the first step of each episode is
+        # always logged since reset() clears the tracker), to verify prompt injection works.
+        # repr formatting exposes invisible characters such as trailing spaces or newlines.
+        # if active_prompt != self.last_active_prompt:
+        #     logger.info(
+        #         f"Active prompt changed at step {self.step_counter}: "
+        #         f"{self.last_active_prompt!r} -> {active_prompt!r}"
+        #     )
+        #     self.last_active_prompt = active_prompt
+
         input_obs = self.process_obs(input_obs)
         if self.control_mode == "receeding_temporal":
-            return self.act_receeding_temporal(input_obs)
+            return self.act_receeding_temporal(input_obs, active_prompt=active_prompt)
 
         if self.control_mode == "receeding_horizon":
             if len(self.action_queue) > 0:
@@ -265,7 +298,7 @@ class B1KPolicyWrapper:
             "observation/wrist_image_left": nbatch["observation"][0, 1],
             "observation/wrist_image_right": nbatch["observation"][0, 2],
             "observation/state": joint_positions,
-            "prompt": self.task_prompt,
+            "prompt": active_prompt,
         }
 
         if "observation/egocentric_depth" in nbatch:
